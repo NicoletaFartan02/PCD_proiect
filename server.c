@@ -1,155 +1,352 @@
-#include "utils.h"
-#include "pdf_utils.h"
-#include "convert_utils.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <sys/un.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include "convert_utils.h"
+#include <asm-generic/socket.h>
 
-// structura pentru argumentele thread-ului
-struct ThreadArgs {
-    int client_socket;
-};
+#define PORT 8080
+#define ADMIN_SOCKET_PATH "/tmp/admin_socket"
+#define BUFFER_SIZE 4096
 
-// functia care gestioneaza un client, rulata intr-un thread separat
-void *handle_client(void *args) {
-    struct ThreadArgs *thread_args = (struct ThreadArgs *)args;
-    int client_socket = thread_args->client_socket;
-    free(args);
+void handle_client(int client_fd);
+void process_conversion(int client_fd, const char *input_file, int conversion_option);
 
-    process_client(client_socket);
+void send_conversion_options(int client_fd, const char *extension) {
+    char options[BUFFER_SIZE] = {0};
 
-    close(client_socket);
+    if (strcmp(extension, "txt") == 0) {
+        strcpy(options, "1. TXT to PDF\n2. TXT to ODT\n");     
+    } else 
+        if (strcmp(extension, "docx") == 0) {
+            strcpy(options, "3. DOCX to PDF\n4. DOCX to RTF\n");    
+        } else 
+            if (strcmp(extension, "odt") == 0) {
+                strcpy(options, "5. ODT to TXT\n6. ODT to PDF\n");  
+            } else 
+                if (strcmp(extension, "rtf") == 0) {
+                    strcpy(options, "7. RTF to DOCX\n8. RTF to PDF\n");     
+                } else 
+                    if (strcmp(extension, "pdf") == 0) {
+                        strcpy(options, "9. PDF to DOCX\n10. PDF to ODT\n11. PDF to RTF\n12. PDF to HTML\n");  
+                    } else {
+                            strcpy(options, "Unsupported file extension.\n");
+                        }
 
-    pthread_exit(NULL);
+    write(client_fd, options, strlen(options));
 }
 
-// functia care proceseaza cererile de la un client
-void process_client(int client_socket) {
-    MessageHeader header;
-    receive_header(client_socket, &header);
+void handle_client(int client_fd) {
+    char buffer[BUFFER_SIZE] = {0};
+    char extension[BUFFER_SIZE] = {0};
+    int conversion_option;
 
-    printf("received header from client: operation=%s, file_size=%d\n", header.operation, header.file_size);
-
-    char buffer[1024];
-    int bytes_received, total_bytes = 0;
-    const char *received_filename = "received_file";
-    const char *pdf_filename = "received_file.pdf";
-    const char *docx_filename = "received_file.docx";
-    const char *rtf_filename = "received_file.rtf";
-    const char *html_filename = "received_file.html";
-    const char *image_to_add = "image.jpg";
-
-    FILE *file = fopen(received_filename, "wb");
-    if (!file) {
-        perror("failed to open file");
-        exit(EXIT_FAILURE);
+    // Read the file extension from the client
+    if (read(client_fd, extension, sizeof(extension)) <= 0) {
+        perror("Failed to read file extension");
+        close(client_fd);
+        return;
     }
 
-    // primim fisierul de la client si il salvam pe disc
-    while ((bytes_received = recv(client_socket, buffer, sizeof(buffer), 0)) > 0) {
-        fwrite(buffer, 1, bytes_received, file);
-        total_bytes += bytes_received;
-        if (total_bytes >= header.file_size) break;
+    // Send the conversion options based on the extension
+    send_conversion_options(client_fd, extension);
+
+    // Read the conversion option from the client
+    if (read(client_fd, buffer, sizeof(buffer)) <= 0) {
+        perror("Failed to read conversion option");
+        close(client_fd);
+        return;
+    }
+    conversion_option = atoi(buffer);
+
+    // Read the file size from the client
+    size_t file_size;
+    if (read(client_fd, &file_size, sizeof(file_size)) <= 0) {
+        perror("Failed to read file size");
+        close(client_fd);
+        return;
     }
 
-    fclose(file);
-    printf("file received and saved as %s. total bytes: %d\n", received_filename, total_bytes);
-
-    // verificam ce operatie trebuie sa realizam
-    if (strncmp(header.operation, "SEND", sizeof(header.operation)) == 0) {
-        char text_buffer[1024];
-        bytes_received = recv(client_socket, text_buffer, sizeof(text_buffer), 0);
-        text_buffer[bytes_received] = '\0'; // adaugare terminator null pentru a converti in sir de caractere.
-        add_text_to_pdf(received_filename, "am procesat acest fisier");
-        
-        // trimitem un mesaj de confirmare catre client
-        const char *confirmation_message = "text added successfully!";
-        send(client_socket, confirmation_message, strlen(confirmation_message), 0);
-    } else if (strncmp(header.operation, "PDF2DOCX", sizeof(header.operation)) == 0) {
-        rename(received_filename, pdf_filename);
-        pdf_to_docx(pdf_filename, docx_filename);
-    } else if (strncmp(header.operation, "DOCX2PDF", sizeof(header.operation)) == 0) {
-        rename(received_filename, docx_filename);
-        docx_to_pdf(docx_filename, pdf_filename);
-    } else if (strncmp(header.operation, "PDF2RTF", sizeof(header.operation)) == 0) {
-        rename(received_filename, pdf_filename);
-        pdf_to_rtf(pdf_filename, rtf_filename);
-    } else if (strncmp(header.operation, "PDF2HTML", sizeof(header.operation)) == 0) {
-        rename(received_filename, pdf_filename);
-        pdf_to_html(pdf_filename, html_filename);
-    } else if (strncmp(header.operation, "IMGINPDF", sizeof(header.operation)) == 0) {
-        rename(received_filename, pdf_filename);
-        add_image_to_pdf(pdf_filename, image_to_add);
-    } else {
-        printf("unknown operation\n");
+    // Read file from client
+    char input_file_template[BUFFER_SIZE] = "input_file_XXXXXX";
+    int input_fd = mkstemp(input_file_template);
+    if (input_fd == -1) {
+        perror("Failed to create temporary input file");
+        close(client_fd);
+        return;
     }
 
-    close(client_socket);
+    ssize_t bytes_received;
+    size_t total_bytes_received = 0;
+
+    while (total_bytes_received < file_size && (bytes_received = read(client_fd, buffer, BUFFER_SIZE)) > 0) {
+        if (write(input_fd, buffer, bytes_received) != bytes_received) {
+            perror("Failed to write to temporary input file");
+            close(input_fd);
+            close(client_fd);
+            return;
+        }
+        total_bytes_received += bytes_received;
+    }
+    close(input_fd);
+
+    if (total_bytes_received != file_size) {
+        fprintf(stderr, "File size mismatch: expected %zu bytes, but received %zu bytes\n", file_size, total_bytes_received);
+        unlink(input_file_template);
+        close(client_fd);
+        return;
+    }
+
+    // Rename the temporary file to include the original extension
+    char input_file_with_extension[BUFFER_SIZE];
+    snprintf(input_file_with_extension, sizeof(input_file_with_extension), "%s.%s", input_file_template, extension);
+    if (rename(input_file_template, input_file_with_extension) != 0) {
+        perror("Failed to rename temporary input file");
+        close(client_fd);
+        return;
+    }
+
+    // Process the conversion
+    process_conversion(client_fd, input_file_with_extension, conversion_option);
+
+    // Delete the temporary input file
+    unlink(input_file_with_extension);
+
+    close(client_fd);
 }
 
-int main() {
+
+void send_file_to_client(int client_fd, const char *file_path, const char *extension) {
+    int fd = open(file_path, O_RDONLY);
+    if (fd == -1) {
+        perror("Failed to open file");
+        return;
+    }
+
+    // Send the file extension first
+    if (write(client_fd, extension, strlen(extension) + 1) < 0) {
+        perror("Failed to send file extension");
+        close(fd);
+        return;
+    }
+    sleep(0.2); // Optional: Ensure the extension is sent before the file size
+
+    // Send the file size next
+    struct stat file_stat;
+    if (fstat(fd, &file_stat) < 0) {
+        perror("Failed to get file size");
+        close(fd);
+        return;
+    }
+    size_t file_size = file_stat.st_size;
+    if (write(client_fd, &file_size, sizeof(file_size)) < 0) {
+        perror("Failed to send file size");
+        close(fd);
+        return;
+    }
+
+    // Send the file content
+    char buffer[BUFFER_SIZE];
+    ssize_t bytes_read;
+
+    while ((bytes_read = read(fd, buffer, BUFFER_SIZE)) > 0) {
+        if (write(client_fd, buffer, bytes_read) != bytes_read) {
+            perror("Failed to send file");
+            close(fd);
+            return;
+        }
+    }
+
+    close(fd);
+}
+
+void process_conversion(int client_fd, const char *input_file, int conversion_option) {
+    char output_file_template[BUFFER_SIZE] = "output_file_XXXXXX";
+    int output_fd = mkstemp(output_file_template);
+    if (output_fd == -1) {
+        perror("Failed to create temporary output file");
+        return;
+    }
+    close(output_fd); // Close the file descriptor, we'll use the filename
+
+    char output_file[BUFFER_SIZE];
+    const char *extension;
+
+    // Choose the right conversion based on the option
+    switch (conversion_option) {
+        case 1:
+            extension = ".pdf";
+            snprintf(output_file, sizeof(output_file), "%s%s", output_file_template, extension);
+            convert_txt_to_pdf(input_file, output_file);
+            break;
+        case 2:
+            extension = ".odt";
+            snprintf(output_file, sizeof(output_file), "%s%s", output_file_template, extension);
+            convert_txt_to_odt(input_file, output_file);
+            break;
+        case 3:
+            extension = ".pdf";
+            snprintf(output_file, sizeof(output_file), "%s%s", output_file_template, extension);
+            convert_docx_to_pdf(input_file, output_file);
+            break;
+        case 4:
+            extension = ".rtf";
+            snprintf(output_file, sizeof(output_file), "%s%s", output_file_template, extension);
+            convert_docx_to_rtf(input_file, output_file);
+            break;
+        case 5:
+            extension = ".txt";
+            snprintf(output_file, sizeof(output_file), "%s%s", output_file_template, extension);
+            convert_odt_to_txt(input_file, output_file);
+            break;
+        case 6:
+            extension = ".pdf";
+            snprintf(output_file, sizeof(output_file), "%s%s", output_file_template, extension);
+            convert_odt_to_pdf(input_file, output_file);
+            break;
+        case 7:
+            extension = ".docx";
+            snprintf(output_file, sizeof(output_file), "%s%s", output_file_template, extension);
+            convert_rtf_to_docx(input_file, output_file);
+            break;
+        case 8:
+            extension = ".pdf";
+            snprintf(output_file, sizeof(output_file), "%s%s", output_file_template, extension);
+            convert_rtf_to_pdf(input_file, output_file);
+            break;
+        case 9:
+            extension = ".docx";
+            snprintf(output_file, sizeof(output_file), "%s%s", output_file_template, extension);
+            convert_pdf_to_docx(input_file, output_file);
+            break;
+        case 10:
+            extension = ".odt";
+            snprintf(output_file, sizeof(output_file), "%s%s", output_file_template, extension);
+            convert_pdf_to_odt(input_file, output_file);
+            break;
+        case 11:
+            extension = ".rtf";
+            snprintf(output_file, sizeof(output_file), "%s%s", output_file_template, extension);
+            convert_pdf_to_rtf(input_file, output_file);
+            break;
+        case 12:
+            extension = ".html";
+            snprintf(output_file, sizeof(output_file), "%s%s", output_file_template, extension);
+            convert_pdf_to_html(input_file, output_file);
+            break;
+        default:
+            write(client_fd, "Invalid conversion option.\n", 27);
+            return;
+    }
+
+    // Send the converted file back to the client
+    send_file_to_client(client_fd, output_file, extension);
+
+    // Delete the temporary output file after sending
+    unlink(output_file);
+}
+
+void *handle_admin_client(void *arg) {
     int server_fd, client_fd;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t client_addr_len = sizeof(client_addr);
+    struct sockaddr_un address;
 
-    // cream un socket tcp pentru server
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        perror("failed to create socket");
+    if ((server_fd = socket(AF_UNIX, SOCK_STREAM, 0)) == 0) {
+        perror("socket failed");
         exit(EXIT_FAILURE);
     }
 
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(8080);
-    server_addr.sin_addr.s_addr = INADDR_ANY;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    strncpy(address.sun_path, ADMIN_SOCKET_PATH, sizeof(address.sun_path) - 1);
+    unlink(ADMIN_SOCKET_PATH);
 
-    // legam socket-ul la adresa specificata
-    if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("failed to bind socket");
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        perror("bind failed");
+        close(server_fd);
         exit(EXIT_FAILURE);
     }
 
-    // punem serverul in modul de ascultare
-    if (listen(server_fd, 5) < 0) {
-        perror("failed to listen on socket");
+    if (listen(server_fd, 3) < 0) {
+        perror("listen");
+        close(server_fd);
         exit(EXIT_FAILURE);
     }
 
-    printf("server listening on port 8080\n");
+    if ((client_fd = accept(server_fd, NULL, NULL)) < 0) {
+        perror("accept");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    handle_client(client_fd);
+
+    close(client_fd);
+    close(server_fd);
+    return NULL;
+}
+
+void *handle_simple_clients(void *arg) {
+    int server_fd, new_socket;
+    struct sockaddr_in address;
+    int opt = 1;
+    int addrlen = sizeof(address);
+
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        perror("socket failed");
+        exit(EXIT_FAILURE);
+    }
+
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+        perror("setsockopt");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
+
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        perror("bind failed");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    if (listen(server_fd, 3) < 0) {
+        perror("listen");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
 
     while (1) {
-        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
-        if (client_fd < 0) {
-            perror("failed to accept connection");
+        if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
+            perror("accept");
             continue;
         }
 
-        printf("new connection, socket fd is %d, ip is : %s, port : %d\n",
-               client_fd, inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
-
-        struct ThreadArgs *thread_args = malloc(sizeof(struct ThreadArgs));
-        if (!thread_args) {
-            perror("failed to allocate memory");
-            close(client_fd);
-            continue;
-        }
-        thread_args->client_socket = client_fd;
-
-        pthread_t thread;
-        if (pthread_create(&thread, NULL, handle_client, (void *)thread_args) != 0) {
-            perror("failed to create thread");
-            free(thread_args);
-            close(client_fd);
-            continue;
-        }
-        
-        pthread_detach(thread);
+        handle_client(new_socket);
+        close(new_socket);
     }
 
     close(server_fd);
+    return NULL;
+}
+
+int main() {
+    pthread_t admin_thread, clients_thread;
+
+    pthread_create(&admin_thread, NULL, handle_admin_client, NULL);
+    pthread_create(&clients_thread, NULL, handle_simple_clients, NULL);
+
+    pthread_join(admin_thread, NULL);
+    pthread_join(clients_thread, NULL);
+
     return 0;
 }
