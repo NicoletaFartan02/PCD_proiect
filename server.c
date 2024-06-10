@@ -9,36 +9,64 @@
 #include <sys/un.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/select.h>
 #include "convert_utils.h"
-#include <asm-generic/socket.h>
 
 #define PORT 8080
 #define ADMIN_SOCKET_PATH "/tmp/admin_socket"
 #define BUFFER_SIZE 4096
 
+typedef struct {
+    int client_fd;
+    char input_file[BUFFER_SIZE];
+    int conversion_option;
+} conversion_task_t;
+
+pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+conversion_task_t *task_queue[BUFFER_SIZE];
+int queue_start = 0, queue_end = 0;
+
 void handle_client(int client_fd);
 void process_conversion(int client_fd, const char *input_file, int conversion_option);
+void send_conversion_options(int client_fd, const char *extension);
+void *conversion_worker(void *arg);
+
+void enqueue_task(conversion_task_t *task) {
+    pthread_mutex_lock(&queue_mutex);
+    task_queue[queue_end] = task;
+    queue_end = (queue_end + 1) % BUFFER_SIZE;
+    pthread_cond_signal(&queue_cond);
+    pthread_mutex_unlock(&queue_mutex);
+}
+
+conversion_task_t *dequeue_task() {
+    pthread_mutex_lock(&queue_mutex);
+    while (queue_start == queue_end) {
+        pthread_cond_wait(&queue_cond, &queue_mutex);
+    }
+    conversion_task_t *task = task_queue[queue_start];
+    queue_start = (queue_start + 1) % BUFFER_SIZE;
+    pthread_mutex_unlock(&queue_mutex);
+    return task;
+}
 
 void send_conversion_options(int client_fd, const char *extension) {
     char options[BUFFER_SIZE] = {0};
 
     if (strcmp(extension, "txt") == 0) {
-        strcpy(options, "1. TXT to PDF\n2. TXT to ODT\n");     
-    } else 
-        if (strcmp(extension, "docx") == 0) {
-            strcpy(options, "3. DOCX to PDF\n4. DOCX to RTF\n");    
-        } else 
-            if (strcmp(extension, "odt") == 0) {
-                strcpy(options, "5. ODT to TXT\n6. ODT to PDF\n");  
-            } else 
-                if (strcmp(extension, "rtf") == 0) {
-                    strcpy(options, "7. RTF to DOCX\n8. RTF to PDF\n");     
-                } else 
-                    if (strcmp(extension, "pdf") == 0) {
-                        strcpy(options, "9. PDF to DOCX\n10. PDF to ODT\n11. PDF to RTF\n12. PDF to HTML\n");  
-                    } else {
-                            strcpy(options, "Unsupported file extension.\n");
-                        }
+        strcpy(options, "1. TXT to PDF\n2. TXT to ODT\n");
+    } else if (strcmp(extension, "docx") == 0) {
+        strcpy(options, "3. DOCX to PDF\n4. DOCX to RTF\n");
+    } else if (strcmp(extension, "odt") == 0) {
+        strcpy(options, "5. ODT to TXT\n6. ODT to PDF\n");
+    } else if (strcmp(extension, "rtf") == 0) {
+        strcpy(options, "7. RTF to DOCX\n8. RTF to PDF\n");
+    } else if (strcmp(extension, "pdf") == 0) {
+        strcpy(options, "9. PDF to DOCX\n10. PDF to ODT\n11. PDF to RTF\n12. PDF to HTML\n");
+    } else {
+        strcpy(options, "Unsupported file extension.\n");
+    }
 
     write(client_fd, options, strlen(options));
 }
@@ -113,15 +141,24 @@ void handle_client(int client_fd) {
         return;
     }
 
-    // Process the conversion
-    process_conversion(client_fd, input_file_with_extension, conversion_option);
-
-    // Delete the temporary input file
-    unlink(input_file_with_extension);
-
-    close(client_fd);
+    // Enqueue the task for conversion
+    conversion_task_t *task = malloc(sizeof(conversion_task_t));
+    task->client_fd = client_fd;
+    strcpy(task->input_file, input_file_with_extension);
+    task->conversion_option = conversion_option;
+    enqueue_task(task);
 }
 
+void *conversion_worker(void *arg) {
+    while (1) {
+        conversion_task_t *task = dequeue_task();
+        process_conversion(task->client_fd, task->input_file, task->conversion_option);
+        unlink(task->input_file); // Delete the temporary input file
+        close(task->client_fd);
+        free(task);
+    }
+    return NULL;
+}
 
 void send_file_to_client(int client_fd, const char *file_path, const char *extension) {
     int fd = open(file_path, O_RDONLY);
@@ -279,13 +316,14 @@ void *handle_admin_client(void *arg) {
         exit(EXIT_FAILURE);
     }
 
-    if ((client_fd = accept(server_fd, NULL, NULL)) < 0) {
-        perror("accept");
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
+    while (1) {
+        if ((client_fd = accept(server_fd, NULL, NULL)) < 0) {
+            perror("accept");
+            continue;
+        }
 
-    handle_client(client_fd);
+        handle_client(client_fd);
+    }
 
     close(client_fd);
     close(server_fd);
@@ -325,14 +363,37 @@ void *handle_simple_clients(void *arg) {
         exit(EXIT_FAILURE);
     }
 
+    fd_set read_fds;
+    FD_ZERO(&read_fds);
+    FD_SET(server_fd, &read_fds);
+    int max_fd = server_fd;
+
     while (1) {
-        if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
-            perror("accept");
+        fd_set temp_fds = read_fds;
+
+        if (select(max_fd + 1, &temp_fds, NULL, NULL, NULL) < 0) {
+            perror("select");
             continue;
         }
 
-        handle_client(new_socket);
-        close(new_socket);
+        for (int fd = 0; fd <= max_fd; fd++) {
+            if (FD_ISSET(fd, &temp_fds)) {
+                if (fd == server_fd) {
+                    if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t *)&addrlen)) < 0) {
+                        perror("accept");
+                        continue;
+                    }
+                    FD_SET(new_socket, &read_fds);
+                    if (new_socket > max_fd) {
+                        max_fd = new_socket;
+                    }
+                } else {
+                    handle_client(fd);
+                    FD_CLR(fd, &read_fds);
+                    close(fd);
+                }
+            }
+        }
     }
 
     close(server_fd);
@@ -340,13 +401,15 @@ void *handle_simple_clients(void *arg) {
 }
 
 int main() {
-    pthread_t admin_thread, clients_thread;
+    pthread_t admin_thread, clients_thread, worker_thread;
 
     pthread_create(&admin_thread, NULL, handle_admin_client, NULL);
     pthread_create(&clients_thread, NULL, handle_simple_clients, NULL);
+    pthread_create(&worker_thread, NULL, conversion_worker, NULL);
 
     pthread_join(admin_thread, NULL);
     pthread_join(clients_thread, NULL);
+    pthread_join(worker_thread, NULL);
 
     return 0;
 }
