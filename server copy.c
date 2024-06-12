@@ -170,10 +170,7 @@ void send_file_to_client(int client_fd, const char *dir_path, const char *extens
     close(fd);
 }
 
-void handle_convert_admin()
-{
-    
-}
+
 void process_conversion(int client_fd, const char *input_file, int conversion_option) {
     char output_file_template[BUFFER_SIZE] = "output_file_XXXXXX";
     int output_fd = mkstemp(output_file_template);
@@ -275,16 +272,16 @@ void process_conversion(int client_fd, const char *input_file, int conversion_op
     unlink(output_file);
 }
 void *handle_client_admin(void *arg) {
-    int client_sockfd = *((int *)arg),*new_sock;
+    int client_sockfd = *((int *)arg);
     free(arg);
 
-    char buffer[BUFFER_SIZE];
+    char buffer[BUF_SIZE];
     int n;
 
     while (1) {
         printf("::: Waiting for commands from client...\n");
 
-      if ((n = recv(client_sockfd, buffer, BUFFER_SIZE, 0)) < 0) {
+      if ((n = recv(client_sockfd, buffer, BUF_SIZE, 0)) < 0) {
             perror("recv failed"); // eroare primire comanda de la client
             exit(EXIT_FAILURE);
         }
@@ -300,93 +297,13 @@ void *handle_client_admin(void *arg) {
         }
         else if (command_choice == 3) {
             // Send the number of connected clients
-            char count_msg[BUFFER_SIZE];
-            snprintf(count_msg, BUFFER_SIZE, "Number of connected clients: %d\n", nr_total);
+            char count_msg[BUF_SIZE];
+            snprintf(count_msg, BUF_SIZE, "Number of connected clients: %d\n", nr_total);
             send(client_sockfd, count_msg, strlen(count_msg), 0);
         }
         else if (command_choice == 1) {
-           char buffer1[BUFFER_SIZE] = {0};
-            char extension[BUFFER_SIZE] = {0};
-            int dim;
-            int conversion_option;
-            while (1) {
-                // Read the file extension from the client
-                bzero(extension, sizeof(extension));
-                ssize_t recv_bytes = recv(client_sockfd, extension, sizeof(extension) - 1, 0);
-                if (recv_bytes <= 0) {
-                    perror("Failed to receive file extension");
-                    close(client_sockfd);
-                    return NULL;
-                }
-                extension[recv_bytes] = '\0'; // Ensure the extension is null-terminated
-                printf("Extension received: %s\n", extension);
-
-                // Send the conversion options based on the extension
-                send_conversion_options(client_sockfd, extension);
-
-                bzero(buffer1, sizeof(buffer1));
-                // Read the conversion option from the client
-                recv_bytes = recv(client_sockfd, buffer1, sizeof(buffer1) - 1, 0);
-                if (recv_bytes <= 0) {
-                    perror("Failed to receive conversion option");
-                    close(client_sockfd);
-                    return NULL;
-                }
-                buffer1[recv_bytes] = '\0'; // Ensure the buffer is null-terminated
-                conversion_option = atoi(buffer1);
-                printf("Conversion option chosen: %d\n", conversion_option);
             
-                // Read the file size from the client
-                size_t file_size;
-                recv_bytes = recv(client_sockfd, &file_size, sizeof(file_size), 0);
-                if (recv_bytes <= 0) {
-                    perror("Failed to receive file size");
-                    close(client_sockfd);
-                    return NULL;
-                }
-                printf("File size received: %zu\n", file_size);
-                // Read file from client
-                char input_file_template[BUFFER_SIZE] = "input_file_XXXXXX";
-                int input_fd = mkstemp(input_file_template);
-                if (input_fd == -1) {
-                    perror("Failed to create temporary input file");
-                    close(client_sockfd);
-                    return NULL;
-                }
-
-                ssize_t bytes_received;
-                size_t total_bytes_received = 0;
-
-                while (total_bytes_received < file_size) {
-                    bytes_received = recv(client_sockfd, buffer1, BUFFER_SIZE, 0);
-                    if (bytes_received < 0) {
-                        perror("Error receiving file data");
-                        close(input_fd);
-                        close(client_sockfd);
-                        return NULL;
-                    } else if (bytes_received == 0) {
-                        // End of file
-                        break;
-                    }
-                    printf("Received %zd bytes:\n", bytes_received);
-
-                    write(input_fd, buffer, bytes_received);
-                    total_bytes_received += bytes_received;
-                }
-                close(input_fd);
-
-                // Rename the temporary file to include the original extension
-                char input_file_with_extension[BUFFER_SIZE];
-                snprintf(input_file_with_extension, sizeof(input_file_with_extension), "%s.%s", input_file_template, extension);
-                rename(input_file_template, input_file_with_extension);
-
-                process_conversion(client_sockfd, input_file_with_extension, conversion_option);
-
-                // Delete the temporary input file
-                unlink(input_file_with_extension);
-                // nr_total--;
-                
-            }
+           handle_client(client_sockfd);
         }
          else { // comanda invalida
             send(client_sockfd, "Invalid command", 15, 0);

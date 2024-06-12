@@ -21,6 +21,8 @@ int check_file(const char *input_path, const char *ext) {
 
 // Generic conversion function using libreoffice
 void convert_with_libreoffice(const char *input_path, const char *output_path, const char *format) {
+
+    
     pid_t pid = fork();
     if (pid == 0) {
         execl("/usr/bin/libreoffice", "libreoffice", "--headless", "--convert-to", format, input_path, "--outdir", output_path, NULL);
