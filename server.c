@@ -147,13 +147,13 @@ void send_file_to_client(int client_fd, const char *dir_path, const char *extens
         close(fd);
         return;
     }
-    size_t file_size = file_stat.st_size;
-    if (send(client_fd, &file_size, sizeof(file_size), 0) < 0) {
+    size_t file_size2 = file_stat.st_size;
+    if (send(client_fd, &file_size2, sizeof(file_size2), 0) < 0) {
         perror("Failed to send file size");
         close(fd);
         return;
     }
-    printf("File size received: %zu\n", file_size);
+    printf("File size received: %zu\n", file_size2);
     // Send the file content
     char buffer[BUFFER_SIZE];
     ssize_t bytes_read;
@@ -585,15 +585,164 @@ void *handle_simple_clients(void *arg) {
 
     return NULL;
 }
+void *handle_client_other(void *arg) {
+    int client_fd = *((int *)arg);
+    free(arg);
+    char buffer[BUFFER_SIZE] = {0};
+    char extension[BUFFER_SIZE] = {0};
+    int dim;
+    int conversion_option;
+    while (1) {
+        // Read the file extension from the client
+        bzero(extension, sizeof(extension));
+        ssize_t recv_bytes = recv(client_fd, extension, sizeof(extension) - 1, 0);
+        if (recv_bytes <= 0) {
+            perror("Failed to receive file extension");
+            close(client_fd);
+            return NULL;
+        }
+        extension[recv_bytes] = '\0'; // Ensure the extension is null-terminated
+        printf("Extension received: %s\n", extension);
 
+        // Send the conversion options based on the extension
+        send_conversion_options(client_fd, extension);
+
+        bzero(buffer, sizeof(buffer));
+        // Read the conversion option from the client
+        recv_bytes = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+        if (recv_bytes <= 0) {
+            perror("Failed to receive conversion option");
+            close(client_fd);
+            return NULL;
+        }
+        buffer[recv_bytes] = '\0'; // Ensure the buffer is null-terminated
+        conversion_option = atoi(buffer);
+        printf("Conversion option chosen: %d\n", conversion_option);
+    
+        // Read the file size from the client
+        size_t file_size1;
+        recv_bytes = recv(client_fd, &file_size1, sizeof(file_size1), 0);
+        if (recv_bytes <= 0) {
+            perror("Failed to receive file size");
+            close(client_fd);
+            return NULL;
+        }
+        printf("File size received: %zu\n", file_size1);
+        // Read file from client
+        char input_file_template[BUFFER_SIZE] = "input_file_XXXXXX";
+        int input_fd = mkstemp(input_file_template);
+        if (input_fd == -1) {
+            perror("Failed to create temporary input file");
+            close(client_fd);
+            return NULL;
+        }
+
+        ssize_t bytes_received;
+        size_t total_bytes_received = 0;
+
+        while (total_bytes_received < file_size1) {
+            bytes_received = recv(client_fd, buffer, BUFFER_SIZE, 0);
+            if (bytes_received < 0) {
+                perror("Error receiving file data");
+                close(input_fd);
+                close(client_fd);
+                return NULL;
+            } else if (bytes_received == 0) {
+                // End of file
+                break;
+            }
+            printf("Received %zd bytes:\n", bytes_received);
+
+            write(input_fd, buffer, bytes_received);
+            total_bytes_received += bytes_received;
+        }
+        close(input_fd);
+
+        // Rename the temporary file to include the original extension
+        char input_file_with_extension[BUFFER_SIZE];
+        snprintf(input_file_with_extension, sizeof(input_file_with_extension), "%s.%s", input_file_template, extension);
+        rename(input_file_template, input_file_with_extension);
+
+        process_conversion(client_fd, input_file_with_extension, conversion_option);
+
+        // Delete the temporary input file
+        unlink(input_file_with_extension);
+        // nr_total--;
+    }
+    close(client_fd);
+    return NULL;
+}
+void *handle_other(void *arg) {
+    int server_fd, new_socket,*n_sock;
+    struct sockaddr_in address;
+    int opt = 1;
+    int addrlen = sizeof(address);
+    socklen_t client_len;
+    pthread_t tid;
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        perror("socket failed");
+        exit(EXIT_FAILURE);
+    }
+
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+        perror("setsockopt");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
+
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        perror("bind failed");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    if (listen(server_fd, 3) < 0) {
+        perror("listen");
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    while (1) {
+        if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
+            perror("accept");
+            continue;
+        }
+         printf("::: Client connected...\n");
+
+        // cream un nou thread pentru fiecare client
+        n_sock = malloc(sizeof(int));
+        *n_sock = new_socket;
+        if (pthread_create(&tid, NULL, handle_client_other, (void *)n_sock) < 0) {
+            perror("pthread_create failed");
+            exit(EXIT_FAILURE);
+        }
+
+        // detasam thread-ul astfel incat resursele sa fie eliberate cand thread-ul termina
+        pthread_detach(tid);
+        // nr_total++;
+        // handle_client(new_socket);
+        // close(new_socket);
+    }
+
+    close(server_fd);
+
+    return NULL;
+}
 int main() {
     server_start_time = time(NULL);
-    pthread_t admin_thread, clients_thread, worker_thread;
+    pthread_t admin_thread, clients_thread, worker_thread,other_thread;
 
     pthread_create(&admin_thread, NULL, handle_admin, NULL);
     pthread_create(&clients_thread, NULL, handle_simple_clients, NULL);
+    pthread_create(&other_thread,NULL,handle_other,NULL);
+
 
     pthread_join(admin_thread, NULL);
     pthread_join(clients_thread, NULL);
+    pthread_join(other_thread, NULL);
     return 0;
 }
