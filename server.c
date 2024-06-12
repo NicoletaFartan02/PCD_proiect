@@ -170,10 +170,6 @@ void send_file_to_client(int client_fd, const char *dir_path, const char *extens
     close(fd);
 }
 
-void handle_convert_admin()
-{
-    
-}
 void process_conversion(int client_fd, const char *input_file, int conversion_option) {
     char output_file_template[BUFFER_SIZE] = "output_file_XXXXXX";
     int output_fd = mkstemp(output_file_template);
@@ -274,8 +270,25 @@ void process_conversion(int client_fd, const char *input_file, int conversion_op
     // Delete the temporary output file after sending
     unlink(output_file);
 }
+char *execute_command(const char *cmd) {
+    static char cmd_output[3*BUFFER_SIZE]; // Static to retain value after function returns
+    FILE *fp = popen(cmd, "r"); // Open a pipe to execute the command
+    if (fp == NULL) { // Check for failure to open pipe
+        strcpy(cmd_output, "Error executing command\n");
+        return cmd_output;
+    }
+
+    memset(cmd_output, 0, BUFFER_SIZE); // Clear the output buffer
+    char line[BUFFER_SIZE]={0};
+    while (fgets(line, sizeof(line), fp) != NULL) { // Read command output line by line
+        strncat(cmd_output, line, BUFFER_SIZE - strlen(cmd_output) - 1); // Append to output buffer
+    }
+    pclose(fp); // Close the pipe
+    return cmd_output;
+}
+
 void *handle_client_admin(void *arg) {
-    int client_sockfd = *((int *)arg),*new_sock;
+    int client_sockfd = *((int *)arg);
     free(arg);
 
     char buffer[BUFFER_SIZE];
@@ -284,114 +297,57 @@ void *handle_client_admin(void *arg) {
     while (1) {
         printf("::: Waiting for commands from client...\n");
 
-      if ((n = recv(client_sockfd, buffer, BUFFER_SIZE, 0)) < 0) {
-            perror("recv failed"); // eroare primire comanda de la client
+        if ((n = recv(client_sockfd, buffer, BUFFER_SIZE, 0)) < 0) {
+            perror("recv failed"); // Error receiving command from client
             exit(EXIT_FAILURE);
         }
         buffer[n] = '\0';
         printf("Received option: %s\n", buffer);
         int command_choice = atoi(buffer);
-        if (command_choice==2) { // daca comanda este uptime
-            char *uptime = get_uptime();
-            printf("::: Sending current up time to client...\n");
-            send(client_sockfd, uptime, strlen(uptime), 0);
-        } else if (command_choice== 4) { // daca comanda este quit
-            break;
-        }
-        else if (command_choice == 3) {
-            // Send the number of connected clients
-            char count_msg[BUFFER_SIZE];
-            snprintf(count_msg, BUFFER_SIZE, "Number of connected clients: %d\n", nr_total);
-            send(client_sockfd, count_msg, strlen(count_msg), 0);
-        }
-        else if (command_choice == 1) {
-           char buffer1[BUFFER_SIZE] = {0};
-            char extension[BUFFER_SIZE] = {0};
-            int dim;
-            int conversion_option;
-            while (1) {
-                // Read the file extension from the client
-                bzero(extension, sizeof(extension));
-                ssize_t recv_bytes = recv(client_sockfd, extension, sizeof(extension) - 1, 0);
-                if (recv_bytes <= 0) {
-                    perror("Failed to receive file extension");
-                    close(client_sockfd);
-                    return NULL;
-                }
-                extension[recv_bytes] = '\0'; // Ensure the extension is null-terminated
-                printf("Extension received: %s\n", extension);
 
-                // Send the conversion options based on the extension
-                send_conversion_options(client_sockfd, extension);
-
-                bzero(buffer1, sizeof(buffer1));
-                // Read the conversion option from the client
-                recv_bytes = recv(client_sockfd, buffer1, sizeof(buffer1) - 1, 0);
-                if (recv_bytes <= 0) {
-                    perror("Failed to receive conversion option");
-                    close(client_sockfd);
-                    return NULL;
-                }
-                buffer1[recv_bytes] = '\0'; // Ensure the buffer is null-terminated
-                conversion_option = atoi(buffer1);
-                printf("Conversion option chosen: %d\n", conversion_option);
-            
-                // Read the file size from the client
-                size_t file_size;
-                recv_bytes = recv(client_sockfd, &file_size, sizeof(file_size), 0);
-                if (recv_bytes <= 0) {
-                    perror("Failed to receive file size");
-                    close(client_sockfd);
-                    return NULL;
-                }
-                printf("File size received: %zu\n", file_size);
-                // Read file from client
-                char input_file_template[BUFFER_SIZE] = "input_file_XXXXXX";
-                int input_fd = mkstemp(input_file_template);
-                if (input_fd == -1) {
-                    perror("Failed to create temporary input file");
-                    close(client_sockfd);
-                    return NULL;
-                }
-
-                ssize_t bytes_received;
-                size_t total_bytes_received = 0;
-
-                while (total_bytes_received < file_size) {
-                    bytes_received = recv(client_sockfd, buffer1, BUFFER_SIZE, 0);
-                    if (bytes_received < 0) {
-                        perror("Error receiving file data");
-                        close(input_fd);
-                        close(client_sockfd);
-                        return NULL;
-                    } else if (bytes_received == 0) {
-                        // End of file
-                        break;
-                    }
-                    printf("Received %zd bytes:\n", bytes_received);
-
-                    write(input_fd, buffer, bytes_received);
-                    total_bytes_received += bytes_received;
-                }
-                close(input_fd);
-
-                // Rename the temporary file to include the original extension
-                char input_file_with_extension[BUFFER_SIZE];
-                snprintf(input_file_with_extension, sizeof(input_file_with_extension), "%s.%s", input_file_template, extension);
-                rename(input_file_template, input_file_with_extension);
-
-                process_conversion(client_sockfd, input_file_with_extension, conversion_option);
-
-                // Delete the temporary input file
-                unlink(input_file_with_extension);
-                // nr_total--;
-                
-            }
-        }
-         else { // comanda invalida
-            send(client_sockfd, "Invalid command", 15, 0);
+        char *stats;
+        switch (command_choice) {
+            case 1:
+                stats = execute_command("top -bn1 -i");
+                printf("::: Sending current top stats to client...\n");
+                send(client_sockfd, stats, strlen(stats), 0);
+                break;
+            case 2:
+                stats = get_uptime();
+                printf("::: Sending server uptime to client...\n");
+                send(client_sockfd, stats, strlen(stats), 0);
+                break;
+            case 3:
+                stats = execute_command("df -h");
+                printf("::: Sending disk usage stats to client...\n");
+                send(client_sockfd, stats, strlen(stats), 0);
+                break;
+            case 4:
+                stats = execute_command("netstat -tuln");
+                printf("::: Sending network connection stats to client...\n");
+                send(client_sockfd, stats, strlen(stats), 0);
+                break;
+            case 5:
+                stats = execute_command("ifconfig");
+                printf("::: Sending network interface stats to client...\n");
+                send(client_sockfd, stats, strlen(stats), 0);
+                break;
+            case 6:
+                stats = execute_command("ls -l");
+                printf("::: Sending directory listing to client...\n");
+                send(client_sockfd, stats, strlen(stats), 0);
+                break;
+            case 7:
+                printf("Client admin disconnected\n");
+                close(client_sockfd);
+                pthread_exit(NULL);
+                break;
+            default:
+                send(client_sockfd, "Invalid command", 15, 0);
+                break;
         }
     }
+
     printf("Admin disconnected.\n");
     close(client_sockfd);
 
@@ -399,10 +355,11 @@ void *handle_client_admin(void *arg) {
     pthread_mutex_lock(&admin_lock);
     admin_connected = 0;
     pthread_mutex_unlock(&admin_lock);
-    // inchidem socketul clientului
+    // Close the client's socket
     close(client_sockfd);
     pthread_exit(NULL);
 }
+
 void *handle_admin(void *arg) {
     nr_total++;
     unlink(ADMIN_SOCKET_PATH);
